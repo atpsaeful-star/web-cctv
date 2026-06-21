@@ -87,7 +87,7 @@ ffmpeg -encoders | grep aac
 **Opsi A – git clone:**
 ```bash
 cd /opt
-sudo git clone https://github.com/atpsaeful-star/web-cctv
+sudo git clone https://github.com/username/web-cctv-hg680p.git webcctv
 cd webcctv
 # atau kalau file sudah di-upload manual:
 cd /root/web-cctv

@@ -541,12 +541,23 @@ app.post('/api/cameras/:id/ping', auth('admin'), async (req,res)=>{
 // ===== RECORDING =====
 const activeRecords = new Map();
 function recordArgs(input, outputMp4, durationSec){
-  const args = [
-    '-rtsp_transport','tcp','-i', input,'-t', String(durationSec),
-    '-c:v','libx264','-preset','veryfast','-profile:v','main','-pix_fmt','yuv420p',
-    '-s', process.env.REC_SIZE || '1280x720','-r','20','-b:v','1200k',
-    '-movflags','+faststart','-y', outputMp4
-  ];
+  const args = [];
+  if (input.startsWith('rtsp:')) {
+    args.push('-rtsp_transport', 'tcp');
+  }
+  args.push(
+    '-i', input,
+    '-t', String(durationSec),
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-profile:v', 'main',
+    '-pix_fmt', 'yuv420p',
+    '-s', process.env.REC_SIZE || '1280x720',
+    '-r', '20',
+    '-b:v', '1200k',
+    '-movflags', '+faststart',
+    '-y', outputMp4
+  );
   if(HAVE_AAC) args.splice(-2,0,'-c:a','aac','-b:a','96k'); else args.splice(-2,0,'-an');
   return args;
 }
@@ -589,6 +600,22 @@ app.post('/api/record/:id/stop', auth('admin'), (req,res)=>{
   if(rec){ rec.proc.kill('SIGINT'); return res.json({success:true}); }
   res.json({success:false});
 });
+app.get('/api/record/active', authOptional, (req, res) => {
+  const activeList = [];
+  activeRecords.forEach((val, key) => {
+    try {
+      const cam = db.prepare('SELECT name FROM cameras WHERE id=?').get(key);
+      activeList.push({
+        camera_id: parseInt(key),
+        camera_name: cam ? cam.name : `Camera ${key}`,
+        recordRowId: val.recordRowId
+      });
+    } catch (e) {
+      console.error(e);
+    }
+  });
+  res.json(activeList);
+});
 app.get('/api/records', auth(), (req,res)=>{
   const cam = req.query.camera_id;
   let rows;
@@ -604,6 +631,61 @@ app.delete('/api/records/:id', auth('admin'), (req,res)=>{
   }
   db.prepare('DELETE FROM records WHERE id=?').run(req.params.id);
   res.json({success:true});
+});
+
+// disk space helper
+function getDiskSpace() {
+  return new Promise((resolve) => {
+    const fallback = { total_gb: '16.0', used_gb: '8.0', free_gb: '8.0', used_percent: 50 };
+    if (process.platform === 'win32') {
+      return resolve(fallback);
+    }
+    const { exec } = require('child_process');
+    exec(`df -m "${RECORD_DIR}"`, (err, stdout) => {
+      if (err || !stdout) return resolve(fallback);
+      try {
+        const lines = stdout.trim().split('\n');
+        if (lines.length < 2) return resolve(fallback);
+        // Parse columns: Filesystem, 1M-blocks, Used, Available, Use%, Mounted on
+        const parts = lines[1].replace(/\s+/g, ' ').split(' ');
+        const totalMb = parseInt(parts[1]);
+        const usedMb = parseInt(parts[2]);
+        const freeMb = parseInt(parts[3]);
+        const percent = parseInt(parts[4].replace('%', ''));
+        resolve({
+          total_gb: (totalMb / 1024).toFixed(1),
+          used_gb: (usedMb / 1024).toFixed(1),
+          free_gb: (freeMb / 1024).toFixed(1),
+          used_percent: percent
+        });
+      } catch {
+        resolve(fallback);
+      }
+    });
+  });
+}
+
+app.get('/api/system/storage', authOptional, async (req, res) => {
+  const disk = await getDiskSpace();
+  let recordsSizeMb = 0;
+  try {
+    const walk = (dir) => {
+      let s = 0;
+      if (fs.existsSync(dir)) {
+        fs.readdirSync(dir, { withFileTypes: true }).forEach(e => {
+          const p = path.join(dir, e.name);
+          if (e.isDirectory()) s += walk(p);
+          else try { s += fs.statSync(p).size; } catch {}
+        });
+      }
+      return s;
+    };
+    recordsSizeMb = +(walk(RECORD_DIR) / 1024 / 1024).toFixed(1);
+  } catch {}
+  res.json({
+    ...disk,
+    records_size_mb: recordsSizeMb
+  });
 });
 
 // dashboard
