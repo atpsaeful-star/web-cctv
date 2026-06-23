@@ -38,6 +38,7 @@ const i18n = {
     menu_cameras: "Kelola Kamera",
     menu_users: "Kelola User",
     menu_settings: "Pengaturan",
+    menu_monitor: "Monitor Publik (Terpisah)",
     logout: "Keluar",
     login: "Masuk",
     username: "Nama Pengguna",
@@ -100,6 +101,7 @@ const i18n = {
     rec_duration: "Durasi",
     rec_size: "Ukuran",
     records_empty: "Tidak ada file rekaman ditemukan.",
+    delete_all_records: "Hapus Semua",
     play_recording: "Putar Rekaman",
 
     // Cameras Admin View
@@ -176,6 +178,7 @@ const i18n = {
     menu_cameras: "Manage Cameras",
     menu_users: "Manage Users",
     menu_settings: "Settings",
+    menu_monitor: "Public Monitor (Separate)",
     logout: "Logout",
     login: "Login",
     username: "Username",
@@ -238,6 +241,7 @@ const i18n = {
     rec_duration: "Duration",
     rec_size: "Size",
     records_empty: "No recording files found.",
+    delete_all_records: "Delete All",
     play_recording: "Play Recording",
 
     // Cameras Admin View
@@ -375,7 +379,9 @@ function checkAuthSession() {
     // Set User Profile UI info
     const userNameEl = document.getElementById("user-display-name");
     const userRoleEl = document.getElementById("user-display-role");
+    const pwdUsernameEl = document.getElementById("pwd-username");
     if (userNameEl) userNameEl.innerText = currentUser.username;
+    if (pwdUsernameEl) pwdUsernameEl.value = currentUser.username;
     if (userRoleEl) {
       userRoleEl.innerText = currentUser.role === 'admin' ? 
         (currentLanguage === 'id' ? "Administrator" : "Administrator") : 
@@ -598,10 +604,11 @@ function navigateToView(viewId) {
     loadRecordsAndCamerasFilter();
     loadActiveRecordings();
     loadStorageStatus();
-    // Poll active recordings & storage space status every 5 seconds on recordings page
+    // Poll active recordings, storage space, and files list every 5 seconds for full real-time updates!
     liveGridInterval = setInterval(() => {
       loadActiveRecordings();
       loadStorageStatus();
+      loadRecords();
     }, 5000);
   } else if (viewId === "cameras") {
     loadAdminCameras();
@@ -667,6 +674,39 @@ async function loadDashboardStats() {
     setInner("stat-streaming-now", stats.streamingNow);
     setInner("stat-recording-now", stats.recordingNow);
     setInner("stat-records-size", stats.recordsSizeMb + " MB");
+
+    // Load CPU, RAM, and Temperature dynamically!
+    try {
+      const resSpecs = await fetch("/api/system/specs", { headers });
+      const specs = await resSpecs.json();
+      
+      const cpuEl = document.getElementById("sys-cpu");
+      const tempEl = document.getElementById("sys-temp");
+      const ramEl = document.getElementById("sys-ram");
+
+      if (cpuEl) cpuEl.innerText = `${specs.cpu}%`;
+      if (tempEl) {
+        if (specs.temp) {
+          tempEl.innerText = `${specs.temp} °C`;
+          const t = parseFloat(specs.temp);
+          if (t >= 75) {
+            tempEl.className = "font-mono font-bold text-red-500 animate-pulse";
+          } else if (t >= 60) {
+            tempEl.className = "font-mono font-bold text-amber-500";
+          } else {
+            tempEl.className = "font-mono font-bold text-emerald-500";
+          }
+        } else {
+          tempEl.innerText = "N/A";
+          tempEl.className = "font-mono font-semibold text-slate-500";
+        }
+      }
+      if (ramEl) {
+        ramEl.innerText = `${specs.ram_used} / ${specs.ram_total} GB (${specs.ram_percent}%)`;
+      }
+    } catch (e) {
+      console.error("Gagal memuat system specs:", e.message);
+    }
 
     // Load Camera Connection Status list
     const resCams = await fetch("/api/cameras/status", { headers });
@@ -1297,7 +1337,26 @@ async function loadRecords() {
     if (!token) return;
     const headers = { "Authorization": `Bearer ${token}` };
     const res = await fetch(url, { headers });
-    recordsList = await res.json();
+    const rawList = await res.json();
+
+    // Fetch dynamic date & time search values
+    const dateVal = document.getElementById("records-filter-date").value; // e.g. "2026-06-21"
+    const timeVal = document.getElementById("records-filter-time").value; // e.g. "14:30"
+
+    // Filter recordings dynamically on client-side
+    recordsList = rawList.filter(rec => {
+      // 1. Check Date Match
+      if (dateVal) {
+        if (!rec.start_time || !rec.start_time.startsWith(dateVal)) return false;
+      }
+      // 2. Check Time/Hour Match (starts with "HH:MM")
+      if (timeVal) {
+        if (!rec.start_time) return false;
+        const timePart = rec.start_time.split(' ')[1]; // extract "HH:MM:SS"
+        if (!timePart || !timePart.startsWith(timeVal)) return false;
+      }
+      return true;
+    });
 
     const tbody = document.getElementById("records-table-body");
     if (!tbody) return;
@@ -1383,6 +1442,426 @@ async function handleDeleteRecord(id) {
   }
 }
 
+// ================= MODAL PLAYBACK =================
+function playPlaybackVideo(filePath, camName) {
+  const modal = document.getElementById("modal-playback");
+  const video = document.getElementById("playback-video");
+  
+  const title = document.getElementById("playback-title");
+  const subtitle = document.getElementById("playback-subtitle");
+  if (title) title.innerText = camName;
+  if (subtitle) subtitle.innerText = filePath.split('/').pop();
+  if (video) video.src = filePath;
+  
+  if (modal) {
+    modal.classList.remove("hidden");
+    modal.classList.add("flex");
+  }
+  if (video) video.play().catch(() => {});
+}
+
+function closePlaybackModal() {
+  const modal = document.getElementById("modal-playback");
+  const video = document.getElementById("playback-video");
+  
+  if (modal) {
+    modal.classList.add("hidden");
+    modal.classList.remove("flex");
+  }
+  if (video) {
+    video.pause();
+    video.src = "";
+  }
+}
+
+// ================= MODAL PLAYER & STREAMING =================
+async function openPlayerModal(cameraId) {
+  playerCamId = cameraId;
+  playerRetryCount = 0;
+  
+  const token = safeStorage.getItem("token");
+  const headers = { "Authorization": `Bearer ${token}` };
+  const res = await fetch("/api/cameras", { headers });
+  const cams = await res.json();
+  const cam = cams.find(c => c.id === cameraId);
+  if (!cam) return;
+
+  // Render modal titles
+  document.getElementById("player-title").innerText = cam.name;
+  document.getElementById("player-subtitle").innerText = cam.location || "--";
+  
+  // Open player modal
+  const modal = document.getElementById("modal-player");
+  if (modal) {
+    modal.classList.remove("hidden");
+    modal.classList.add("flex");
+  }
+
+  // Show splash loading
+  const splash = document.getElementById("player-splash");
+  const splashMsg = document.getElementById("player-splash-msg");
+  const splashIcon = document.getElementById("player-splash-icon");
+  if (splash) splash.classList.remove("hidden");
+  if (splashMsg) splashMsg.innerText = currentLanguage === 'id' ? "Memulai streaming, silakan tunggu..." : "Starting stream, please wait...";
+  if (splashIcon) {
+    splashIcon.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i>`;
+    splashIcon.className = "text-blue-500 text-2xl md:text-3xl animate-spin";
+  }
+
+  const video = document.getElementById("cctv-video");
+  const iframe = document.getElementById("cctv-iframe");
+  if (video) video.classList.add("hidden");
+  if (iframe) iframe.classList.add("hidden");
+
+  // Set defaults for admin-only displays inside player modal
+  if (currentUser && currentUser.role === 'admin') {
+    document.getElementById("player-rec-panel").classList.remove("hidden");
+    document.getElementById("player-admin-stream-ctrl").classList.remove("hidden");
+  } else {
+    document.getElementById("player-rec-panel").classList.add("hidden");
+    document.getElementById("player-admin-stream-ctrl").classList.add("hidden");
+  }
+
+  // Fetch status of recording
+  checkPlayerRecordingStatus(cameraId);
+
+  // Trigger stream start
+  startPlayerCctvStream(cam);
+}
+
+function closePlayerModal() {
+  const modal = document.getElementById("modal-player");
+  if (modal) {
+    modal.classList.add("hidden");
+    modal.classList.remove("flex");
+  }
+
+  // Destroy HLS instances
+  if (activePlayerHls) {
+    activePlayerHls.destroy();
+    activePlayerHls = null;
+  }
+  const video = document.getElementById("cctv-video");
+  if (video) video.src = "";
+  const iframe = document.getElementById("cctv-iframe");
+  if (iframe) iframe.src = "";
+
+  // Stop Log & Uptime timers
+  clearInterval(playerUptimeInterval);
+  clearInterval(activeLogInterval);
+  
+  // Close log drawer
+  const drawer = document.getElementById("player-log-drawer");
+  const btn = document.getElementById("ff-log-btn-text");
+  if (drawer) drawer.classList.add("hidden");
+  if (btn) btn.innerText = currentLanguage === 'id' ? "Lihat Log FFmpeg" : "View FFmpeg Log";
+
+  playerCamId = null;
+}
+
+async function startPlayerCctvStream(cam) {
+  try {
+    const token = safeStorage.getItem("token");
+    const headers = { "Authorization": `Bearer ${token}` };
+    const res = await fetch(`/api/stream/${cam.id}/start`, { method: "POST", headers });
+    const data = await res.json();
+
+    if (!res.ok) throw new Error(data.error || "Gagal inisialisasi live");
+
+    // Live state clocks & uptime starts
+    initPlayerStats(cam.id);
+
+    const video = document.getElementById("cctv-video");
+    const iframe = document.getElementById("cctv-iframe");
+    const splash = document.getElementById("player-splash");
+
+    if (data.youtube) {
+      // YouTube Embed
+      if (iframe) {
+        iframe.src = `https://www.youtube.com/embed/${data.youtube}?autoplay=1&mute=1&controls=1&rel=0`;
+        iframe.classList.remove("hidden");
+      }
+      if (splash) splash.classList.add("hidden");
+      
+      document.getElementById("player-status-badge").innerText = "ONLINE";
+      document.getElementById("player-status-badge").className = "font-semibold text-emerald-500";
+      document.getElementById("player-method-val").innerText = "YouTube Live";
+    } else if (data.hls) {
+      // play HLS
+      document.getElementById("player-method-val").innerText = data.direct ? "HLS Direct" : "RTSP Transcode";
+      playHlsWithReconnect(data.hls);
+    }
+  } catch (err) {
+    showPlayerErrorSplash(err.message);
+  }
+}
+
+function playHlsWithReconnect(hlsUrl) {
+  const video = document.getElementById("cctv-video");
+  const splash = document.getElementById("player-splash");
+  const badge = document.getElementById("player-status-badge");
+  const retryRow = document.getElementById("player-retry-row");
+  const retryVal = document.getElementById("player-retry-val");
+
+  if (activePlayerHls) {
+    activePlayerHls.destroy();
+    activePlayerHls = null;
+  }
+
+  const loadStream = (url) => {
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        maxMaxBufferLength: 8,
+        enableWorker: true,
+        manifestLoadingMaxRetry: 10,
+        levelLoadingMaxRetry: 10
+      });
+      activePlayerHls = hls;
+
+      hls.loadSource(url);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (video) video.classList.remove("hidden");
+        if (splash) splash.classList.add("hidden");
+        if (video) video.play().catch(() => {});
+        if (badge) {
+          badge.innerText = "LIVE";
+          badge.className = "font-semibold text-emerald-500";
+        }
+        if (retryRow) retryRow.classList.add("hidden");
+        playerRetryCount = 0;
+      });
+
+      // Error/Stall Handling with Reconnect
+      hls.on(Hls.Events.ERROR, (evt, errData) => {
+        console.error("HLS Player Event Error:", errData);
+        
+        if (errData.fatal) {
+          if (playerRetryCount < 10) {
+            playerRetryCount++;
+            if (retryRow) retryRow.classList.remove("hidden");
+            if (retryVal) retryVal.innerText = `${playerRetryCount} / 10`;
+            if (badge) {
+              badge.innerText = "RECONNECTING...";
+              badge.className = "font-semibold text-amber-500";
+            }
+
+            const backoff = Math.min(3 + playerRetryCount * 2, 15);
+            console.log(`HLS fatal error. Retrying HLS stream in ${backoff}s (attempt ${playerRetryCount}/10)...`);
+            
+            // Try CORS proxy fallback if it fails on direct attempt
+            let targetUrl = url;
+            if (playerRetryCount >= 2 && !url.includes("/api/hls-proxy")) {
+              targetUrl = `/api/hls-proxy?url=${encodeURIComponent(url)}`;
+              console.log("Switching to CORS HLS proxy...");
+            }
+
+            setTimeout(() => {
+              hls.loadSource(targetUrl);
+              hls.startLoad();
+            }, backoff * 1000);
+          } else {
+            showPlayerErrorSplash(currentLanguage === 'id' ? "Gagal tersambung ke aliran kamera CCTV (Maksimal percobaan)." : "Failed to connect to CCTV stream (Max retries).");
+          }
+        }
+      });
+    } else if (video && video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url;
+      video.classList.remove("hidden");
+      if (splash) splash.classList.add("hidden");
+      video.play().catch(() => {});
+      if (badge) {
+        badge.innerText = "LIVE";
+        badge.className = "font-semibold text-emerald-500";
+      }
+    }
+  };
+
+  loadStream(hlsUrl);
+}
+
+function showPlayerErrorSplash(msg) {
+  const splash = document.getElementById("player-splash");
+  const splashMsg = document.getElementById("player-splash-msg");
+  const splashIcon = document.getElementById("player-splash-icon");
+  const badge = document.getElementById("player-status-badge");
+
+  if (splash) splash.classList.remove("hidden");
+  if (splashMsg) splashMsg.innerText = msg;
+  if (splashIcon) {
+    splashIcon.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i>`;
+    splashIcon.className = "text-red-500 text-3xl";
+  }
+
+  const video = document.getElementById("cctv-video");
+  const iframe = document.getElementById("cctv-iframe");
+  if (video) video.classList.add("hidden");
+  if (iframe) iframe.classList.add("hidden");
+  
+  if (badge) {
+    badge.innerText = "OFFLINE";
+    badge.className = "font-semibold text-red-500";
+  }
+}
+
+function initPlayerStats(cameraId) {
+  clearInterval(playerUptimeInterval);
+  playerUptimeSec = 0;
+  
+  const uptimeVal = document.getElementById("player-uptime-val");
+  if (uptimeVal) uptimeVal.innerText = "0s";
+
+  playerUptimeInterval = setInterval(() => {
+    playerUptimeSec++;
+    const m = Math.floor(playerUptimeSec / 60);
+    const s = playerUptimeSec % 60;
+    if (uptimeVal) {
+      uptimeVal.innerText = m > 0 ? `${m}m ${s}s` : `${s}s`;
+    }
+  }, 1000);
+
+  if (currentUser && currentUser.role === 'admin') {
+    fetchFfLog(cameraId);
+    clearInterval(activeLogInterval);
+    activeLogInterval = setInterval(() => fetchFfLog(cameraId), 4000);
+  }
+}
+
+async function fetchFfLog(cameraId) {
+  try {
+    const token = safeStorage.getItem("token");
+    const headers = { "Authorization": `Bearer ${token}` };
+    const res = await fetch(`/api/stream/${cameraId}/log`, { headers });
+    if (res.ok) {
+      const logText = await res.text();
+      const el = document.getElementById("player-log-content");
+      if (el) el.textContent = logText || "No logs yet.";
+    }
+  } catch (err) {
+    console.error("FFmpeg log fail:", err);
+  }
+}
+
+function toggleFfLog() {
+  const drawer = document.getElementById("player-log-drawer");
+  const btn = document.getElementById("ff-log-btn-text");
+  if (!drawer || !btn) return;
+  
+  if (drawer.classList.contains("hidden")) {
+    drawer.classList.remove("hidden");
+    btn.innerText = currentLanguage === 'id' ? "Sembunyikan Log FFmpeg" : "Hide FFmpeg Log";
+  } else {
+    drawer.classList.add("hidden");
+    btn.innerText = currentLanguage === 'id' ? "Lihat Log FFmpeg" : "View FFmpeg Log";
+  }
+}
+
+async function handleForceStopStream() {
+  if (!playerCamId) return;
+  const askMsg = currentLanguage === 'id' ? "Paksa matikan stream FFmpeg untuk kamera ini?" : "Force kill FFmpeg stream for this camera?";
+  if (!confirm(askMsg)) return;
+
+  try {
+    const token = safeStorage.getItem("token");
+    const headers = { "Authorization": `Bearer ${token}` };
+    const res = await fetch(`/api/stream/${playerCamId}/stop`, { method: "POST", headers });
+    if (!res.ok) throw new Error("Gagal mematikan stream");
+    showToast(currentLanguage === 'id' ? "Stream dihentikan" : "Stream killed", "success");
+    closePlayerModal();
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+}
+
+async function checkPlayerRecordingStatus(cameraId) {
+  try {
+    const token = safeStorage.getItem("token");
+    const headers = { "Authorization": `Bearer ${token}` };
+    const res = await fetch("/api/dashboard", { headers });
+    const stats = await res.json();
+    
+    const resRecs = await fetch("/api/records", { headers });
+    const recs = await resRecs.json();
+    const activeThisCam = recs.find(r => r.camera_id === cameraId && r.status === 'recording');
+
+    if (activeThisCam) {
+      setRecordingStateActive(true);
+    } else {
+      setRecordingStateActive(false);
+    }
+  } catch (err) {
+    console.error("Recording status check error:", err);
+  }
+}
+
+function setRecordingStateActive(active) {
+  isRecordingActive = active;
+  clearInterval(recordTimerInterval);
+
+  const nonAct = document.getElementById("rec-not-active");
+  const act = document.getElementById("rec-active");
+
+  if (active) {
+    if (nonAct) nonAct.classList.add("hidden");
+    if (act) act.classList.remove("hidden");
+    
+    recordTimerSec = 0;
+    recordTimerInterval = setInterval(() => {
+      recordTimerSec++;
+      const m = String(Math.floor(recordTimerSec / 60)).padStart(2,'0');
+      const s = String(recordTimerSec % 60).padStart(2,'0');
+      const timerEl = document.getElementById("rec-active-timer");
+      if (timerEl) timerEl.innerText = `${m}:${s}`;
+    }, 1000);
+  } else {
+    if (nonAct) nonAct.classList.remove("hidden");
+    if (act) act.classList.add("hidden");
+  }
+}
+
+async function handleStartRecordingInPlayer() {
+  if (!playerCamId) return;
+  const dur = document.getElementById("rec-duration-sec").value;
+
+  try {
+    const token = safeStorage.getItem("token");
+    const headers = {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json"
+    };
+    const res = await fetch(`/api/record/${playerCamId}/start`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ duration: dur })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error);
+
+    showToast(currentLanguage === 'id' ? "Perekaman berhasil dimulai!" : "Recording started successfully!", "success");
+    setRecordingStateActive(true);
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+}
+
+async function handleStopRecordingInPlayer() {
+  if (!playerCamId) return;
+
+  try {
+    const token = safeStorage.getItem("token");
+    const headers = { "Authorization": `Bearer ${token}` };
+    const res = await fetch(`/api/record/${playerCamId}/stop`, { method: "POST", headers });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error);
+
+    showToast(currentLanguage === 'id' ? "Perekaman dihentikan" : "Recording stopped", "success");
+    setRecordingStateActive(false);
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+}
+
 // Toggle manual recording dropdown selection box
 function toggleManualRecordForm() {
   const panel = document.getElementById("manual-record-form-panel");
@@ -1446,7 +1925,7 @@ async function loadActiveRecordings() {
 
     if (!panel || !listEl) return;
 
-    if (list.length === 0) {
+    if (!list || !Array.isArray(list) || list.length === 0) {
       panel.classList.add("hidden");
       if (recBadge) recBadge.classList.add("hidden");
       return;
@@ -1499,6 +1978,31 @@ async function stopRecordingFromPage(camId) {
   }
 }
 
+// Bulk delete all completed recording files and database logs
+async function handleDeleteAllRecords() {
+  const askMsg = currentLanguage === 'id' ? 
+    "⚠️ PERINGATAN: Apakah Anda yakin ingin MENGHAPUS SEMUA berkas rekaman di hardisk? Tindakan ini tidak bisa dibatalkan!" : 
+    "⚠️ WARNING: Are you sure you want to DELETE ALL recording files from the hard drive? This action cannot be undone!";
+  if (!confirm(askMsg)) return;
+
+  showLoader(currentLanguage === 'id' ? "Menghapus semua rekaman..." : "Deleting all recordings...");
+
+  try {
+    const token = safeStorage.getItem("token");
+    const headers = { "Authorization": `Bearer ${token}` };
+    const res = await fetch("/api/records", { method: "DELETE", headers });
+    if (!res.ok) throw new Error("Gagal menghapus semua rekaman");
+
+    showToast(currentLanguage === 'id' ? "Semua rekaman berhasil dibersihkan!" : "All recordings successfully deleted!", "success");
+    loadRecords();
+    loadStorageStatus();
+  } catch (err) {
+    showToast(err.message, "error");
+  } finally {
+    hideLoader();
+  }
+}
+
 // Loads hard drive total space, remaining free space, and the size of recording directory
 async function loadStorageStatus() {
   try {
@@ -1538,6 +2042,49 @@ async function loadStorageStatus() {
   }
 }
 
+// Resets date and time filters on the recordings table
+function resetRecordsFilters() {
+  const camFilter = document.getElementById("records-filter-camera");
+  const dateFilter = document.getElementById("records-filter-date");
+  const timeFilter = document.getElementById("records-filter-time");
+
+  if (camFilter) camFilter.value = "";
+  if (dateFilter) dateFilter.value = "";
+  if (timeFilter) timeFilter.value = "";
+
+  loadRecords();
+}
+
+// Convert actual recorded cron string into selectable Preset options
+function getPresetFromSchedule(sched) {
+  if (!sched) return "24h";
+  sched = sched.trim();
+  if (sched === "24h" || sched === "* * * * *") return "24h";
+  if (sched === "*/1 * * * *" || sched === "*/1") return "*/1";
+  if (sched === "*/5 * * * *" || sched === "*/5") return "*/5";
+  if (sched === "*/15 * * * *" || sched === "*/15") return "*/15";
+  if (sched === "*/30 * * * *" || sched === "*/30") return "*/30";
+  if (sched === "0 * * * *" || sched === "0") return "0";
+  return "custom";
+}
+
+// Handles preset dropdown change and toggles custom cron text input
+function handleRecSchedulePresetChange(val) {
+  const customDiv = document.getElementById("custom-cron-div");
+  const schedInput = document.getElementById("cam-rec-schedule");
+  const customInput = document.getElementById("cam-rec-schedule-custom-val");
+  
+  if (!customDiv || !schedInput || !customInput) return;
+
+  if (val === "custom") {
+    customDiv.classList.remove("hidden");
+    schedInput.value = customInput.value;
+  } else {
+    customDiv.classList.add("hidden");
+    schedInput.value = val;
+  }
+}
+
 // ================= VIEW: CAMERAS CRUD =================
 async function loadAdminCameras() {
   try {
@@ -1565,8 +2112,13 @@ async function loadAdminCameras() {
         `<span class="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block"></span>` :
         `<span class="w-2.5 h-2.5 rounded-full bg-slate-500 inline-block"></span>`;
 
+      // Visual helper for continuous recording schedule
+      const isContinuous = cam.record_schedule === '24h' || cam.record_schedule === '* * * * *';
+      const scheduleLabel = isContinuous ? 
+        (currentLanguage === 'id' ? '24 Jam Non-stop' : '24h Continuous') : cam.record_schedule;
+
       const recBadge = cam.record_enabled ? 
-        `<span class="text-[10px] text-rose-400 bg-rose-500/10 px-1.5 py-0.5 rounded font-mono block mb-1">Dur: ${cam.record_duration}s</span><span class="text-[9px] text-slate-400 font-mono block">${cam.record_schedule}</span>` :
+        `<span class="text-[10px] text-rose-400 bg-rose-500/10 px-1.5 py-0.5 rounded font-mono block mb-1 truncate" style="max-width:130px">Dur: ${cam.record_duration}s</span><span class="text-[9px] text-slate-400 font-mono block truncate" style="max-width:130px" title="${scheduleLabel}">${scheduleLabel}</span>` :
         `<span class="text-slate-500 text-xs">-</span>`;
 
       tr.innerHTML = `
@@ -1626,6 +2178,16 @@ async function openCameraFormModal(camId = null) {
   // Set default scheduled record state
   toggleFormRecordSettings(false);
 
+  // Set default schedule preset to 24h
+  const presetEl = document.getElementById("cam-rec-schedule-preset");
+  const schedEl = document.getElementById("cam-rec-schedule");
+  const customDiv = document.getElementById("custom-cron-div");
+  const customVal = document.getElementById("cam-rec-schedule-custom-val");
+
+  if (presetEl) presetEl.value = "24h";
+  if (schedEl) schedEl.value = "24h";
+  if (customDiv) customDiv.classList.add("hidden");
+
   if (camId) {
     document.getElementById("camera-form-title").innerText = currentLanguage === 'id' ? "Edit Kamera" : "Edit Camera";
     
@@ -1649,15 +2211,27 @@ async function openCameraFormModal(camId = null) {
     const recEnabled = cam.record_enabled === 1;
     document.getElementById("cam-rec-enabled").checked = recEnabled;
     toggleFormRecordSettings(recEnabled);
-    document.getElementById("cam-rec-schedule").value = cam.record_schedule || "0 * * * *";
-    document.getElementById("cam-rec-duration").value = cam.record_duration || 300;
 
+    // Populate preset or custom cron schedule
+    const preset = getPresetFromSchedule(cam.record_schedule);
+    if (presetEl) presetEl.value = preset;
+    if (schedEl) schedEl.value = cam.record_schedule || "24h";
+    
+    if (preset === "custom") {
+      if (customDiv) customDiv.classList.remove("hidden");
+      if (customVal) customVal.value = cam.record_schedule || "0 * * * *";
+    } else {
+      if (customDiv) customDiv.classList.add("hidden");
+    }
+
+    document.getElementById("cam-rec-duration").value = cam.record_duration || 300;
     document.getElementById("cam-is-public").checked = cam.is_public === 1;
     document.getElementById("cam-is-active").checked = cam.is_active === 1;
 
   } else {
     document.getElementById("camera-form-title").innerText = currentLanguage === 'id' ? "Tambah Kamera" : "Add Camera";
     document.getElementById("cam-id").value = "";
+    document.getElementById("cam-rec-duration").value = 300;
   }
 
   modal.classList.remove("hidden");
@@ -1683,6 +2257,13 @@ function toggleFormRecordSettings(checked) {
 async function handleSaveCamera(e) {
   e.preventDefault();
   
+  // Resolve schedule value
+  const preset = document.getElementById("cam-rec-schedule-preset").value;
+  let scheduleVal = preset;
+  if (preset === "custom") {
+    scheduleVal = document.getElementById("cam-rec-schedule-custom-val").value.trim() || "0 * * * *";
+  }
+
   const id = document.getElementById("cam-id").value;
   const body = {
     name: document.getElementById("cam-name").value,
@@ -1694,7 +2275,7 @@ async function handleSaveCamera(e) {
     lat: parseFloat(document.getElementById("cam-lat").value) || null,
     lng: parseFloat(document.getElementById("cam-lng").value) || null,
     record_enabled: document.getElementById("cam-rec-enabled").checked,
-    record_schedule: document.getElementById("cam-rec-schedule").value,
+    record_schedule: scheduleVal,
     record_duration: parseInt(document.getElementById("cam-rec-duration").value) || 300,
     is_public: document.getElementById("cam-is-public").checked,
     is_active: document.getElementById("cam-is-active").checked,
@@ -1956,11 +2537,12 @@ async function handleSaveAppSettings(e) {
 async function handleChangePassword(e) {
   e.preventDefault();
   
+  const updatedUsername = document.getElementById("pwd-username").value.trim();
   const oldPw = document.getElementById("pwd-old").value;
   const newPw = document.getElementById("pwd-new").value;
   const confirmPw = document.getElementById("pwd-new-confirm").value;
 
-  if (newPw !== confirmPw) {
+  if (newPw && newPw !== confirmPw) {
     showToast(currentLanguage === 'id' ? "Konfirmasi sandi baru tidak cocok!" : "New password confirmations do not match!", "error");
     return;
   }
@@ -1972,17 +2554,33 @@ async function handleChangePassword(e) {
   };
 
   try {
-    const res = await fetch("/api/profile/password", {
+    const res = await fetch("/api/profile/update", {
       method: "POST",
       headers,
-      body: JSON.stringify({ old_password: oldPw, new_password: newPw })
+      body: JSON.stringify({ 
+        username: updatedUsername, 
+        old_password: oldPw, 
+        new_password: newPw 
+      })
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Gagal mengubah kata sandi");
+    if (!res.ok) throw new Error(data.error || "Gagal memperbarui profil");
 
-    showToast(currentLanguage === 'id' ? "Kata sandi berhasil diubah!" : "Password successfully changed!", "success");
-    const form = document.getElementById("settings-pwd-form");
-    if (form) form.reset();
+    // Simpan token & user baru jika berhasil mengubah username
+    safeStorage.setItem("token", data.token);
+    safeStorage.setItem("user", JSON.stringify({ username: data.username, role: currentUser.role }));
+    currentUser.username = data.username;
+
+    // Perbarui nama di sidebar & header
+    const userNameEl = document.getElementById("user-display-name");
+    if (userNameEl) userNameEl.innerText = data.username;
+
+    showToast(currentLanguage === 'id' ? "Profil berhasil diperbarui!" : "Profile successfully updated!", "success");
+    
+    // Kosongkan kolom password setelah berhasil
+    document.getElementById("pwd-old").value = "";
+    document.getElementById("pwd-new").value = "";
+    document.getElementById("pwd-new-confirm").value = "";
   } catch (err) {
     showToast(err.message, "error");
   }
@@ -1996,14 +2594,16 @@ function showLoader(msg) {
   if (loader) {
     loader.classList.remove("hidden");
     loader.classList.remove("opacity-0");
+    loader.classList.remove("pointer-events-none");
   }
 }
 
-// Hides loader animation safely
+// Hides loader animation safely and IMMEDIATELY prevents it from blocking pointer/clicks!
 function hideLoader() {
   const loader = document.getElementById("global-loader");
   if (loader) {
     loader.classList.add("opacity-0");
+    loader.classList.add("pointer-events-none"); // Instant click release!
     setTimeout(() => {
       loader.classList.add("hidden");
     }, 300);

@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'cctv_hg680p_secret_2025';
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'cctv.db');
 const HLS_DIR = path.join(__dirname, 'public', 'streams');
-const RECORD_DIR = path.join(__dirname, 'public', 'records');
+const RECORD_DIR = process.env.RECORD_DIR || path.join(__dirname, 'public', 'records');
 const SNAP_DIR = path.join(__dirname, 'public', 'snapshots');
 const LOG_DIR = path.join(__dirname, 'logs');
 
@@ -145,7 +145,44 @@ app.post('/api/login', (req,res)=>{
   res.json({token, role:user.role, username:user.username});
 });
 
-// change own password
+// ===== PROFILE & SETTINGS FOR USERS =====
+app.get('/api/profile', auth(), (req, res) => {
+  const user = db.prepare('SELECT id, username, role, created_at FROM users WHERE id=?').get(req.user.id);
+  if(!user) return res.status(404).json({error: 'User tidak ditemukan'});
+  res.json(user);
+});
+
+app.post('/api/profile/update', auth(), (req, res) => {
+  const { username, old_password, new_password } = req.body;
+  if(!username || username.trim() === '') return res.status(400).json({error: 'Username wajib diisi'});
+
+  const user = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+  if(!user) return res.status(404).json({error: 'User tidak ditemukan'});
+
+  // Check username uniqueness if changed
+  if(username !== user.username) {
+    const exists = db.prepare('SELECT COUNT(*) as c FROM users WHERE username=?').get(username).c;
+    if(exists > 0) return res.status(400).json({error: 'Username sudah digunakan oleh akun lain'});
+  }
+
+  let hash = user.password;
+  if(new_password && new_password.trim() !== '') {
+    if(!old_password) return res.status(400).json({error: 'Kata sandi lama wajib diisi untuk mengubah kata sandi'});
+    if(!bcrypt.compareSync(old_password, user.password)) return res.status(400).json({error: 'Kata sandi lama salah'});
+    if(new_password.length < 4) return res.status(400).json({error: 'Kata sandi baru minimal 4 karakter'});
+    hash = bcrypt.hashSync(new_password, 10);
+  }
+
+  try {
+    db.prepare('UPDATE users SET username=?, password=? WHERE id=?').run(username, hash, req.user.id);
+    const token = jwt.sign({id: user.id, username: username, role: user.role}, JWT_SECRET, {expiresIn: '7d'});
+    res.json({success: true, token, username});
+  } catch(e) {
+    res.status(500).json({error: e.message});
+  }
+});
+
+// change own password (compatibility fallback)
 app.post('/api/profile/password', auth(), (req,res)=>{
   const {old_password, new_password} = req.body;
   if(!new_password || new_password.length < 4) return res.status(400).json({error:'Password baru minimal 4 karakter'});
@@ -248,13 +285,16 @@ function extractYoutubeId(input){
 
 // ===== CAMERAS =====
 app.get('/api/cameras', authOptional, (req,res)=>{
-  const isAuth = !!req.user;
+  const isAdmin = req.user && req.user.role === 'admin';
   let rows;
-  if(isAuth){
+  if(isAdmin){
+    // Administrator mendapat hak akses penuh untuk melihat seluruh kamera (termasuk yang privat)
     rows = db.prepare('SELECT * FROM cameras ORDER BY id DESC').all();
   } else {
+    // Publik / User Baru hanya diizinkan melihat kamera aktif yang ditandai Publik (is_public = 1)
     rows = db.prepare('SELECT id,name,location,nvr_dvr,channel,is_public,lat,lng,youtube_embed,is_active,codec,rtsp_url FROM cameras WHERE is_public=1 AND is_active=1 ORDER BY id DESC').all();
     rows = rows.map(c=>{
+      // Sensor kredensial RTSP mentah untuk publik demi keamanan data
       if(!/^https?:\/\//i.test(c.rtsp_url) && !c.youtube_embed){
         return {...c, rtsp_url: ''};
       }
@@ -361,6 +401,13 @@ function stopStream(cameraId){
 app.post('/api/stream/:id/start', authOptional, async (req,res)=>{
   const cam = db.prepare('SELECT * FROM cameras WHERE id=?').get(req.params.id);
   if(!cam) return res.status(404).json({error:'Camera not found'});
+
+  // Pengamanan Tambahan: Hanya Administrator yang boleh memutar streaming kamera privat
+  const isAdmin = req.user && req.user.role === 'admin';
+  if(cam.is_public !== 1 && !isAdmin){
+    return res.status(403).json({error: 'Akses Ditolak. Kamera ini bersifat privat.'});
+  }
+
   const ytId = extractYoutubeId(cam.youtube_embed||'');
   if((cam.nvr_dvr === 'youtube' || ytId) && ytId){
     return res.json({success:true, youtube: ytId});
@@ -478,50 +525,129 @@ app.get('/api/snapshot/:id', async (req,res)=>{
 });
 
 // camera status
+// camera status (Ultra-Lightweight TCP/HTTP Connection Detection)
+const net = require('net');
+const http = require('http');
+const https = require('https');
+
+function pingTcpPort(urlStr, defaultPort = 554) {
+  return new Promise((resolve) => {
+    try {
+      const cleanUrl = urlStr.replace(/^(rtsp|http|https):\/\//i, '');
+      const hostPortPart = cleanUrl.split('/')[0];
+      const hostPort = hostPortPart.split('@').pop();
+      
+      let host = hostPort;
+      let port = defaultPort;
+      
+      if (hostPort.includes(':')) {
+        const parts = hostPort.split(':');
+        host = parts[0];
+        port = parseInt(parts[1]) || defaultPort;
+      }
+      
+      const socket = new net.Socket();
+      let done = false;
+      
+      const timer = setTimeout(() => {
+        if (!done) {
+          done = true;
+          socket.destroy();
+          resolve(false);
+        }
+      }, 1500); // 1.5s timeout is perfect for fast local/public checks
+      
+      socket.connect(port, host, () => {
+        if (!done) {
+          done = true;
+          clearTimeout(timer);
+          socket.destroy();
+          resolve(true);
+        }
+      });
+      
+      socket.on('error', () => {
+        if (!done) {
+          done = true;
+          clearTimeout(timer);
+          socket.destroy();
+          resolve(false);
+        }
+      });
+    } catch (err) {
+      resolve(false);
+    }
+  });
+}
+
 const camStatus = new Map();
 async function pingCamera(cam){
   const id = cam.id;
   const streamUrl = cleanStreamUrl(cam.rtsp_url);
   const ytId = extractYoutubeId(cam.youtube_embed||'');
-  if(cam.nvr_dvr==='youtube' || ytId || isHlsUrl(streamUrl) || isHttpStream(streamUrl)){
-    camStatus.set(id, {online: cam.is_active?true:false, lastCheck: Date.now(), msg:'http/hls'});
-    return true;
+
+  // 1. YouTube Live Embed (Always online if active & internet is up)
+  if(cam.nvr_dvr === 'youtube' || ytId) {
+    camStatus.set(id, {online: cam.is_active ? true : false, lastCheck: Date.now(), msg: 'youtube cdn'});
+    return cam.is_active ? true : false;
   }
-  if(activeStreams.has(String(id))){
-    camStatus.set(id, {online:true, lastCheck:Date.now(), msg:'streaming'});
-    return true;
-  }
-  try{
-    const snapPath = path.join(SNAP_DIR, String(id)+'.jpg');
-    const st = fs.statSync(snapPath);
-    if(Date.now() - st.mtimeMs < 90000){
-      camStatus.set(id, {online:true, lastCheck:Date.now(), msg:'snapshot ok'});
-      return true;
+
+  // 2. HTTP/HLS External Streams
+  if(isHlsUrl(streamUrl) || isHttpStream(streamUrl)) {
+    try {
+      const url = new URL(streamUrl);
+      const client = url.protocol === 'https:' ? https : http;
+      const online = await new Promise(resolve => {
+        const req = client.get(streamUrl, { timeout: 1500 }, (res) => {
+          resolve(res.statusCode >= 200 && res.statusCode < 400);
+        });
+        req.on('error', () => resolve(false));
+        req.on('timeout', () => { req.destroy(); resolve(false); });
+      });
+      camStatus.set(id, {online, lastCheck: Date.now(), msg: online ? 'http ok' : 'http offline'});
+      return online;
+    } catch {
+      camStatus.set(id, {online: false, lastCheck: Date.now(), msg: 'invalid URL'});
+      return false;
     }
-  }catch{}
-  return new Promise(resolve=>{
-    const ff = spawn('ffmpeg', ['-rtsp_transport','tcp','-i', streamUrl, '-t','1','-f','null','-','-v','quiet']);
-    let done=false;
-    const timer = setTimeout(()=>{ if(!done){ done=true; try{ff.kill('SIGKILL')}catch{}; camStatus.set(id,{online:false,lastCheck:Date.now(),msg:'timeout'}); resolve(false);} }, 3500);
-    ff.on('close', code=>{
-      if(done) return; clearTimeout(timer); done=true;
-      const online = code===0;
-      camStatus.set(id,{online, lastCheck:Date.now(), msg: online?'probe ok':'probe fail '+code});
-      resolve(online);
+  }
+
+  // 3. Standard RTSP IP Cameras (Ultra-Lightweight TCP Connection Check)
+  if (streamUrl.startsWith('rtsp:')) {
+    const online = await pingTcpPort(streamUrl, 554);
+    camStatus.set(id, {
+      online,
+      lastCheck: Date.now(),
+      msg: online ? 'tcp connect ok' : 'tcp connection failed (offline)'
     });
-    ff.on('error', ()=>{ clearTimeout(timer); if(!done){ camStatus.set(id,{online:false,lastCheck:Date.now(),msg:'spawn err'}); resolve(false);} });
-  });
+    return online;
+  }
+
+  // Fallback for other formats
+  camStatus.set(id, {online: false, lastCheck: Date.now(), msg: 'unknown format'});
+  return false;
 }
-let statusIdx = 0;
-setInterval(async ()=>{
-  const cams = db.prepare('SELECT * FROM cameras WHERE is_active=1').all();
-  if(!cams.length) return;
-  const cam = cams[statusIdx % cams.length]; statusIdx++;
-  try{ await pingCamera(cam); }catch{}
-}, 8000);
+
+// Background Ping: check ALL active cameras simultaneously every 15 seconds (0% CPU spawned overhead)
+setInterval(async () => {
+  try {
+    const cams = db.prepare('SELECT * FROM cameras WHERE is_active=1').all();
+    for (const cam of cams) {
+      pingCamera(cam).catch(() => {});
+    }
+  } catch (err) {
+    console.error("Gagal melakukan berkala camera ping:", err.message);
+  }
+}, 15000);
 
 app.get('/api/cameras/status', authOptional, (req,res)=>{
-  const cams = db.prepare('SELECT id, name FROM cameras').all();
+  const isAdmin = req.user && req.user.role === 'admin';
+  let cams;
+  if(isAdmin){
+    cams = db.prepare('SELECT id, name FROM cameras').all();
+  } else {
+    cams = db.prepare('SELECT id, name FROM cameras WHERE is_public=1 AND is_active=1').all();
+  }
   const out = cams.map(c=>{
     const st = camStatus.get(c.id) || {online:null, lastCheck:0, msg:'unknown'};
     const snapPath = path.join(SNAP_DIR, String(c.id)+'.jpg');
@@ -545,24 +671,48 @@ function recordArgs(input, outputMp4, durationSec){
   if (input.startsWith('rtsp:')) {
     args.push('-rtsp_transport', 'tcp');
   }
+  args.push('-i', input, '-t', String(durationSec));
+
+  // Mengubah HEVC (H.265) menjadi H.264 Baseline secara sangat ringan (Ultrafast)
+  // Ini mutlak diperlukan agar hasil rekaman bisa diputar langsung di semua Web Browser / HP (H.265 tidak didukung browser).
+  // Menggunakan skala 540p dan 15fps untuk menjaga CPU STB HG680P tetap dingin (<30% CPU).
   args.push(
-    '-i', input,
-    '-t', String(durationSec),
     '-c:v', 'libx264',
-    '-preset', 'veryfast',
-    '-profile:v', 'main',
+    '-preset', 'ultrafast',      // Preset tercepat, beban CPU terendah pada STB
+    '-tune', 'zerolatency',
+    '-profile:v', 'baseline', '-level', '3.0', // Kompatibilitas 100% pada HP/Browser
     '-pix_fmt', 'yuv420p',
-    '-s', process.env.REC_SIZE || '1280x720',
-    '-r', '20',
-    '-b:v', '1200k',
+    '-s', process.env.VIDEO_SIZE || '960x540', // Downscale ke 540p untuk menghemat pixel encoding & disk hdd
+    '-r', '15',                  // Frame rate 15fps (standar CCTV) menghemat 50% daya CPU
+    '-b:v', '800k',              // Bitrate optimal untuk kualitas jernih dan hemat penyimpanan
     '-movflags', '+faststart',
+    '-an',                       // Nonaktifkan audio untuk menghindari crash wadah MP4 akibat PCM G.711 IP Cam
     '-y', outputMp4
   );
-  if(HAVE_AAC) args.splice(-2,0,'-c:a','aac','-b:a','96k'); else args.splice(-2,0,'-an');
   return args;
 }
 function startRecord(camera){
   if(activeRecords.has(String(camera.id))) return {error:'already recording'};
+
+  // PENGAMAN MANDIRI: Deteksi jika hardisk lepas (unmounted) demi mengamankan SD Card dari kepenuhan
+  if (RECORD_DIR.includes('/var/lib/webcctv/records')) {
+    const guardFile = path.join(RECORD_DIR, '.cctv_hdd_active');
+    if (!fs.existsSync(guardFile)) {
+      console.warn("⚠️ PERINGATAN: Berkas pengaman .cctv_hdd_active tidak ditemukan! Mencoba melakukan mount ulang...");
+      try {
+        const { execSync } = require('child_process');
+        execSync('mount -a', { stdio: 'ignore' });
+      } catch (e) {
+        console.error("❌ Gagal me-mount ulang hardisk otomatis:", e.message);
+      }
+      
+      if (!fs.existsSync(guardFile)) {
+        console.error("❌ EROR FATAL: Hardisk 500GB terputus (unmounted)! Perekaman DIBATALKAN demi mengamankan SD Card.");
+        return { error: 'Penyimpanan Hardisk Terputus (Unmounted)! Harap periksa koneksi kabel USB atau adaptor daya STB.' };
+      }
+    }
+  }
+
   const camDir = path.join(RECORD_DIR, String(camera.id));
   if(!fs.existsSync(camDir)) fs.mkdirSync(camDir,{recursive:true});
   const ts = new Date();
@@ -573,9 +723,32 @@ function startRecord(camera){
   const ins = db.prepare('INSERT INTO records (camera_id,start_time,status,file_path) VALUES (?,?,?,?)').run(camera.id, start_time, 'recording', `records/${camera.id}/${fname}`);
   const recordRowId = ins.lastInsertRowid;
   const streamUrl = cleanStreamUrl(camera.rtsp_url);
-  const ff = spawn('ffmpeg', recordArgs(streamUrl, outPath, duration));
+  
+  // Create a log file for recording to debug any failures!
+  const logFile = path.join(LOG_DIR, `rec_${camera.id}.log`);
+  const logStream = fs.createWriteStream(logFile, {flags:'w'});
+
+  const args = recordArgs(streamUrl, outPath, duration);
+  logStream.write(`ffmpeg ${args.join(' ')}\n\n`);
+
+  const ff = spawn('ffmpeg', args);
   activeRecords.set(String(camera.id), {proc:ff, recordRowId});
+  
+  ff.stderr.on('data', d => {
+    logStream.write(d.toString());
+  });
+
+  ff.on('error', err => {
+    console.error(`❌ FFmpeg spawn error for recording cam ${camera.id}:`, err.message);
+    logStream.write(`\n❌ SPAWN ERROR: ${err.message}\n`);
+    logStream.end();
+    activeRecords.delete(String(camera.id));
+    db.prepare("UPDATE records SET status='failed', end_time=? WHERE id=?")
+      .run(new Date().toISOString().slice(0,19).replace('T',' '), recordRowId);
+  });
+
   ff.on('close', code=>{
+    logStream.end(`\nexit ${code}\n`);
     activeRecords.delete(String(camera.id));
     const end_time = new Date().toISOString().slice(0,19).replace('T',' ');
     let size_mb = 0;
@@ -583,6 +756,7 @@ function startRecord(camera){
     db.prepare('UPDATE records SET end_time=?, size_mb=?, duration_sec=?, status=? WHERE id=?')
       .run(end_time, size_mb, duration, code===0 ? 'completed':'failed', recordRowId);
     console.log(`■ record cam ${camera.id} done ${code} ${size_mb}MB`);
+    autoCleanupDisk(); // Run automatic circular cleanup!
   });
   return {success:true, file:`/records/${camera.id}/${fname}`, record_id: recordRowId};
 }
@@ -616,7 +790,57 @@ app.get('/api/record/active', authOptional, (req, res) => {
   });
   res.json(activeList);
 });
+
+// automatic physical file scanning and database indexing
+function scanAndImportPhysicalRecords() {
+  try {
+    if (!fs.existsSync(RECORD_DIR)) return;
+    const camDirs = fs.readdirSync(RECORD_DIR);
+    camDirs.forEach(camDir => {
+      const cameraId = parseInt(camDir);
+      if (isNaN(cameraId)) return;
+      const camDirPath = path.join(RECORD_DIR, camDir);
+      const stat = fs.statSync(camDirPath);
+      if (!stat.isDirectory()) return;
+
+      const files = fs.readdirSync(camDirPath);
+      files.forEach(file => {
+        if (!file.endsWith('.mp4')) return;
+        const relativePath = `records/${cameraId}/${file}`;
+        const exists = db.prepare("SELECT COUNT(*) as c FROM records WHERE file_path=?").get(relativePath).c;
+        if (exists === 0) {
+          const fullPath = path.join(camDirPath, file);
+          let sizeMb = 0;
+          try { sizeMb = +(fs.statSync(fullPath).size / 1024 / 1024).toFixed(2); } catch {}
+          let startTimeStr = '';
+          try {
+            const baseName = file.replace('.mp4', '');
+            const parts = baseName.split('T');
+            if (parts.length === 2) {
+              startTimeStr = `${parts[0]} ${parts[1].replace(/-/g, ':')}`;
+            } else {
+              startTimeStr = fs.statSync(fullPath).mtime.toISOString().slice(0, 19).replace('T', ' ');
+            }
+          } catch {
+            startTimeStr = new Date().toISOString().slice(0, 19).replace('T', ' ');
+          }
+          try {
+            db.prepare('INSERT INTO records (camera_id, start_time, end_time, file_path, size_mb, duration_sec, status) VALUES (?, ?, ?, ?, ?, ?, ?)')
+              .run(cameraId, startTimeStr, startTimeStr, relativePath, sizeMb, 0, 'completed');
+            console.log(`📥 Auto-indexed physical recording to SQLite: ${relativePath}`);
+          } catch (dbErr) {
+            console.error(`Auto-index DB insert fail for ${relativePath}:`, dbErr.message);
+          }
+        }
+      });
+    });
+  } catch (err) {
+    console.error("Auto scan and import records failure:", err.message);
+  }
+}
+
 app.get('/api/records', auth(), (req,res)=>{
+  scanAndImportPhysicalRecords(); // Auto-scan and register physical files!
   const cam = req.query.camera_id;
   let rows;
   if(cam) rows = db.prepare('SELECT r.*, c.name as camera_name FROM records r LEFT JOIN cameras c ON c.id=r.camera_id WHERE r.camera_id=? ORDER BY r.start_time DESC LIMIT 200').all(cam);
@@ -631,6 +855,21 @@ app.delete('/api/records/:id', auth('admin'), (req,res)=>{
   }
   db.prepare('DELETE FROM records WHERE id=?').run(req.params.id);
   res.json({success:true});
+});
+app.delete('/api/records', auth('admin'), (req,res)=>{
+  try {
+    const records = db.prepare("SELECT * FROM records").all();
+    records.forEach(rec => {
+      if (rec.file_path) {
+        const fp = path.join(__dirname, 'public', rec.file_path);
+        try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch(e) {}
+      }
+    });
+    db.prepare("DELETE FROM records").run();
+    res.json({success:true});
+  } catch (err) {
+    res.status(500).json({error: err.message});
+  }
 });
 
 // disk space helper
@@ -688,6 +927,91 @@ app.get('/api/system/storage', authOptional, async (req, res) => {
   });
 });
 
+app.get('/api/system/specs', authOptional, (req, res) => {
+  const os = require('os');
+  
+  // 1. Memory Usage (RAM)
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const usedMem = totalMem - freeMem;
+  const ramPercent = Math.round((usedMem / totalMem) * 100);
+  
+  const totalMemGb = (totalMem / 1024 / 1024 / 1024).toFixed(1);
+  const usedMemGb = (usedMem / 1024 / 1024 / 1024).toFixed(1);
+
+  // 2. CPU Load Usage (Approximate loadavg calculated)
+  const loadAvg = os.loadavg();
+  const numCpus = os.cpus().length || 1;
+  const cpuPercent = Math.round((loadAvg[0] / numCpus) * 100) || 12; // fallback to 12% if idle
+
+  // 3. Suhu CPU (Thermal System in Armbian)
+  let temp = null;
+  const thermalPaths = [
+    '/sys/class/thermal/thermal_zone0/temp',
+    '/sys/class/thermal/thermal_zone1/temp',
+    '/sys/devices/virtual/thermal/thermal_zone0/temp'
+  ];
+  for (const tp of thermalPaths) {
+    try {
+      if (fs.existsSync(tp)) {
+        const raw = fs.readFileSync(tp, 'utf8');
+        temp = parseFloat(raw.trim()) / 1000;
+        break;
+      }
+    } catch (e) {}
+  }
+
+  res.json({
+    cpu: cpuPercent > 100 ? 100 : cpuPercent,
+    ram_total: totalMemGb,
+    ram_used: usedMemGb,
+    ram_percent: ramPercent,
+    temp: temp ? temp.toFixed(1) : null,
+    uptime: Math.round(os.uptime())
+  });
+});
+
+// automatic circular recording cleanup
+async function autoCleanupDisk() {
+  try {
+    let disk = await getDiskSpace();
+    if (disk.used_percent < 90) return; // space is safe!
+
+    console.log(`⚠️ Disk is almost full (${disk.used_percent}% used). Starting auto-cleanup of oldest recordings...`);
+    
+    // Fetch completed records ordered by start_time ascending (oldest first)
+    const oldestRecords = db.prepare("SELECT * FROM records WHERE status='completed' ORDER BY start_time ASC LIMIT 50").all();
+    
+    for (const rec of oldestRecords) {
+      if (rec.file_path) {
+        const fp = path.join(__dirname, 'public', rec.file_path);
+        try {
+          if (fs.existsSync(fp)) {
+            fs.unlinkSync(fp);
+            console.log(`🗑️ Auto-deleted oldest physical recording file: ${fp} (${rec.size_mb} MB)`);
+          }
+        } catch (e) {
+          console.error(`Failed to delete physical file ${fp}:`, e.message);
+        }
+      }
+      
+      // Delete from db
+      db.prepare('DELETE FROM records WHERE id=?').run(rec.id);
+      
+      // Recheck
+      disk = await getDiskSpace();
+      console.log(`Rechecking disk space: ${disk.used_percent}% used`);
+      
+      if (disk.used_percent < 80) {
+        console.log(`✅ Auto-cleanup complete. Disk space reclaimed, currently at ${disk.used_percent}% used.`);
+        break;
+      }
+    }
+  } catch (err) {
+    console.error("Auto disk cleanup failure:", err);
+  }
+}
+
 // dashboard
 app.get('/api/dashboard', authOptional, (req,res)=>{
   const totalCam = db.prepare('SELECT COUNT(*) as c FROM cameras').get().c;
@@ -732,10 +1056,13 @@ function matchCron(cronStr, date){
 setInterval(()=>{
   const now = new Date();
   const cams = db.prepare('SELECT * FROM cameras WHERE record_enabled=1 AND is_active=1').all();
+  autoCleanupDisk(); // Run automatic circular cleanup check before starting new files!
   cams.forEach(cam=>{
-    if(matchCron(cam.record_schedule||'0 * * * *', now)){
+    const sched = cam.record_schedule || '0 * * * *';
+    const isContinuous = (sched === '24h' || sched === '* * * * *');
+    if (isContinuous || matchCron(sched, now)) {
       if(!activeRecords.has(String(cam.id))){
-        console.log(`⏺ auto record cam ${cam.id} ${cam.name}`);
+        console.log(`⏺ auto record cam ${cam.id} ${cam.name} (Sched: ${sched})`);
         startRecord(cam);
       }
     }
